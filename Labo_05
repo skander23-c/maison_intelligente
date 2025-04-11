@@ -1,0 +1,223 @@
+#include <LiquidCrystal_I2C.h>
+#include <AccelStepper.h>
+
+// === Identifiant ===
+const char* ID_ETUDIANT = "2344779";
+
+// === Composants LCD ===
+LiquidCrystal_I2C ecran(0x27, 16, 2);
+const unsigned long tempoLCD = 100;
+unsigned long dernierRefreshLCD = 0;
+
+// === Capteur Ultrason ===
+const int pinTrig = 6;
+const int pinEcho = 7;
+const unsigned long tempoCapteur = 50;
+unsigned long dernierScan = 0;
+long mesureCM = 0;
+
+// === Moteur Pas-à-Pas ===
+#define TYPE_MOTEUR 4
+const int pinA = 31;
+const int pinB = 33;
+const int pinC = 35;
+const int pinD = 37;
+
+AccelStepper moteur(TYPE_MOTEUR, pinA, pinC, pinB, pinD);
+const int NB_PAS_180 = 2048;
+const int ANGLE_MINIMUM = 10;
+const int ANGLE_MAXIMUM = 170;
+const int DISTANCE_PROCHE = 30;
+const int DISTANCE_LOIN = 60;
+
+int angleCourant = 90;
+int dernierAngle = 90;
+bool moteurAlimente = false;
+
+// === Série ===
+unsigned long dernierEnvoi = 0;
+const unsigned long intervalleSerie = 100;
+
+// === États ===
+enum Situation { OBJET_PROCHE, OBJET_LOINTAIN, OBJET_DETECTE };
+Situation statut = OBJET_LOINTAIN;
+
+// === Alarme ===
+const int buzzer = 2;
+const int ledRouge = 10;
+const int ledBleue = 9;
+
+bool alarmeOn = false;
+unsigned long momentAlarme = 0;
+unsigned long dernierClignotement = 0;
+bool clignote = false;
+
+const int DISTANCE_CRITIQUE = 15;
+const int TEMPS_ALARME = 3000;
+const int VITESSE_CLIGNOTEMENT = 250;
+
+// === Fonctions d'initialisation ===
+void initLCD() {
+  ecran.init();
+  ecran.backlight();
+  ecran.setCursor(0, 0); ecran.print(ID_ETUDIANT);
+  ecran.setCursor(0, 1); ecran.print("Projet 5B");
+  delay(2000);
+  ecran.clear();
+}
+
+void initMoteur() {
+  moteur.setMaxSpeed(500);
+  moteur.setAcceleration(100);
+  moteur.setSpeed(200);
+  moteur.setCurrentPosition(0);
+  moteur.moveTo(0);
+  couperMoteur();
+}
+
+void initCapteur() {
+  pinMode(pinTrig, OUTPUT);
+  pinMode(pinEcho, INPUT);
+}
+
+void initAlerte() {
+  pinMode(buzzer, OUTPUT);
+  pinMode(ledRouge, OUTPUT);
+  pinMode(ledBleue, OUTPUT);
+  digitalWrite(buzzer, LOW);
+  digitalWrite(ledRouge, LOW);
+  digitalWrite(ledBleue, LOW);
+}
+
+// === Fonctions moteur ===
+void activerMoteur() {
+  digitalWrite(pinA, HIGH);
+  digitalWrite(pinB, HIGH);
+  digitalWrite(pinC, HIGH);
+  digitalWrite(pinD, HIGH);
+  moteurAlimente = true;
+}
+
+void couperMoteur() {
+  digitalWrite(pinA, LOW);
+  digitalWrite(pinB, LOW);
+  digitalWrite(pinC, LOW);
+  digitalWrite(pinD, LOW);
+  moteurAlimente = false;
+}
+
+// === Lecture Distance ===
+long mesurerDistance() {
+  digitalWrite(pinTrig, LOW); delayMicroseconds(2);
+  digitalWrite(pinTrig, HIGH); delayMicroseconds(10);
+  digitalWrite(pinTrig, LOW);
+  long duree = pulseIn(pinEcho, HIGH, 30000);
+  long cm = duree * 0.034 / 2;
+  return (cm >= 2 && cm <= 400) ? cm : mesureCM;
+}
+
+// === Conversions ===
+int convertirDistanceEnAngle(long cm) {
+  return constrain(map(cm, DISTANCE_PROCHE, DISTANCE_LOIN, ANGLE_MINIMUM, ANGLE_MAXIMUM), ANGLE_MINIMUM, ANGLE_MAXIMUM);
+}
+
+int convertirAngleEnPas(int angle) {
+  return map(angle, 0, 180, -NB_PAS_180 / 2, NB_PAS_180 / 2);
+}
+
+// === Tâches ===
+void lectureDistance() {
+  if (millis() - dernierScan >= tempoCapteur) {
+    mesureCM = mesurerDistance();
+    dernierScan = millis();
+  }
+}
+
+void miseAJourStatut() {
+  if (mesureCM < DISTANCE_PROCHE) {
+    statut = OBJET_PROCHE;
+  } else if (mesureCM > DISTANCE_LOIN) {
+    statut = OBJET_LOINTAIN;
+  } else {
+    statut = OBJET_DETECTE;
+    angleCourant = convertirDistanceEnAngle(mesureCM);
+  }
+}
+
+void gestionMoteur() {
+  if (statut == OBJET_DETECTE && angleCourant != dernierAngle) {
+    activerMoteur();
+    moteur.moveTo(convertirAngleEnPas(angleCourant));
+    dernierAngle = angleCourant;
+  }
+
+  if (moteur.distanceToGo() != 0) {
+    moteur.run();
+  } else if (moteurAlimente) {
+    couperMoteur();
+  }
+}
+
+void afficherLCD() {
+  if (millis() - dernierRefreshLCD >= tempoLCD) {
+    ecran.clear();
+    ecran.setCursor(0, 0); ecran.print("Mesure: "); ecran.print(mesureCM); ecran.print("cm");
+    ecran.setCursor(0, 1);
+    switch (statut) {
+      case OBJET_PROCHE: ecran.print("Objet trop proche"); break;
+      case OBJET_LOINTAIN: ecran.print("Objet trop loin"); break;
+      case OBJET_DETECTE: ecran.print("Angle: "); ecran.print(angleCourant); break;
+    }
+    dernierRefreshLCD = millis();
+  }
+}
+
+void envoyerSerial() {
+  if (millis() - dernierEnvoi >= intervalleSerie) {
+    Serial.print("id:"); Serial.print(ID_ETUDIANT);
+    Serial.print(",cm:"); Serial.print(mesureCM);
+    Serial.print(",angle:"); Serial.println(angleCourant);
+    dernierEnvoi = millis();
+  }
+}
+
+void alerte() {
+  unsigned long momentActuel = millis();
+
+  if (mesureCM <= DISTANCE_CRITIQUE) {
+    alarmeOn = true;
+    momentAlarme = momentActuel;
+    digitalWrite(buzzer, HIGH);
+
+    if (momentActuel - dernierClignotement >= VITESSE_CLIGNOTEMENT) {
+      clignote = !clignote;
+      digitalWrite(ledRouge, clignote ? HIGH : LOW);
+      digitalWrite(ledBleue, clignote ? LOW : HIGH);
+      dernierClignotement = momentActuel;
+    }
+  } else if (alarmeOn && momentActuel - momentAlarme >= TEMPS_ALARME) {
+    alarmeOn = false;
+    digitalWrite(buzzer, LOW);
+    digitalWrite(ledRouge, LOW);
+    digitalWrite(ledBleue, LOW);
+  }
+}
+
+// === Programme Principal ===
+void setup() {
+  Serial.begin(9600);
+  initLCD();
+  initMoteur();
+  initCapteur();
+  initAlerte();
+}
+
+void loop() {
+  lectureDistance();
+  miseAJourStatut();
+  gestionMoteur();
+  afficherLCD();
+  envoyerSerial();
+  alerte();
+}
+
